@@ -21,8 +21,6 @@
 * **Python 3.8+** (uses standard library modules only—no external `pip` packages required)
 * **Tkinter** (included with standard Windows/macOS Python installs; on Linux/Termux, install `python3-tk`)
 
-```bash
-python antgrid.py
 Project Structure
 antgrid.py — Main application window, 30 FPS game loop, combat resolution, and UI tabs.
 
@@ -35,4 +33,7 @@ network.py — UDP LAN lobby discovery and length-prefixed TCP multiplayer sync.
 editor.py — Interactive map editor, preset loader, and CSV import/export.
 
 config.py — Themes, preset map definitions, BGM patterns, and settings.ini persistence.
-<img width="1920" height="1080" alt="antgrid_b" src="https://github.com/user-attachments/assets/bd9661a9-3dd4-43e2-8e1f-a984467cf3ac" />
+
+```bash
+python antgrid.py
+
