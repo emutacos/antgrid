@@ -21,7 +21,7 @@
 * **Python 3.8+** (uses standard library modules only—no external `pip` packages required)
 * **Tkinter** (included with standard Windows/macOS Python installs; on Linux/Termux, install `python3-tk`)
 
-Project Structure
+## Project Structure
 antgrid.py — Main application window, 30 FPS game loop, combat resolution, and UI tabs.
 
 models.py — Core entities (Tile, AntParticle, MovingGroup, CombatEffect).
@@ -34,6 +34,7 @@ editor.py — Interactive map editor, preset loader, and CSV import/export.
 
 config.py — Themes, preset map definitions, BGM patterns, and settings.ini persistence.
 
+## Run:
 ```bash
 python antgrid.py
 
