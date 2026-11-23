@@ -9,6 +9,7 @@ import platform
 import time
 from datetime import datetime
 from collections import deque
+from network import NetworkMixin, send_framed_packet
 
 try:
     import winsound
@@ -120,7 +121,9 @@ class AntGridApp(LevelEditorMixin, NetworkMixin, AIMixin):
         self.match_event_log = []
 
         self.hill_hold_timers = {1: 0.0, 2: 0.0, 3: 0.0, 4: 0.0}
+        self.hill_win_seconds = 30.0
         self.player_tickets = {1: 100, 2: 100, 3: 100, 4: 100}
+        self.flag_home_coords = {}
 
         # UI Widgets Placeholders
         self.notebook = None
@@ -218,6 +221,20 @@ class AntGridApp(LevelEditorMixin, NetworkMixin, AIMixin):
         except Exception:
             pass
 
+    def trigger_victory(self, winner_player, title, message):
+        if not self.game_running:
+            return
+        self.game_running = False
+        self.selected_tile = None
+        self.valid_targets.clear()
+        self.play_sound("victory")
+        self.log_match_event("GAME_OVER", {"winner": winner_player, "mode": self.victory_mode_var.get()})
+        self.save_match_log_to_disk(winner=f"Player {winner_player}")
+        if self.net_role == "server":
+            self.broadcast_game_state()
+        self.render_canvas()
+        messagebox.showinfo(title, message)
+
     # --- THEME & COLOR CUSTOMIZATION ---
     def load_theme_colors(self):
         theme_name = self.theme_var.get()
@@ -253,7 +270,17 @@ class AntGridApp(LevelEditorMixin, NetworkMixin, AIMixin):
         if self.editor_canvas:
             self.editor_canvas.config(bg=self.board_bg_color)
         self.style.configure("TNotebook", background=self.board_bg_color)
-        self.style.configure("TNotebook.Tab", font=(self.font_family, 10, "bold"))
+        self.style.configure(
+            "TNotebook.Tab",
+            font=(self.font_family, 10, "bold"),
+            background=self.neutral_tile_bg,
+            foreground=self.foreground_color
+        )
+        self.style.map(
+            "TNotebook.Tab",
+            background=[("selected", self.board_bg_color), ("active", "#34495e")],
+            foreground=[("selected", self.foreground_color), ("active", "#ffffff")]
+        )
         self.style.configure("TFrame", background=self.board_bg_color)
         self.style.configure("TLabel", background=self.board_bg_color, foreground=self.foreground_color, font=(self.font_family, 9))
         self.style.configure("Header.TLabel", font=(self.font_family, 11, "bold"), foreground=self.foreground_color)
@@ -262,7 +289,7 @@ class AntGridApp(LevelEditorMixin, NetworkMixin, AIMixin):
         if self.slider_units:
             self.slider_units.config(bg=self.board_bg_color, fg=self.foreground_color)
         if self.lbl_manual:
-            self.lbl_manual.config(bg=self.board_bg_color, fg=self.foreground_color, font=(self.font_family, 8))
+            self.lbl_manual.config(bg=self.board_bg_color, fg=self.foreground_color, font=(self.font_family, 10))
         for p in range(1, 5):
             if p in self.player_stat_labels:
                 self.player_stat_labels[p].config(bg=self.get_player_bg_tint(p), fg=self.player_colors[p], font=(self.font_family, 9, "bold"))
@@ -358,6 +385,7 @@ class AntGridApp(LevelEditorMixin, NetworkMixin, AIMixin):
                 self.match_elapsed_seconds = float(elapsed)
                 self.victory_mode_var.set(vmode)
 
+                self.flag_home_coords.clear()
                 self.grid = [[Tile(r, c) for c in range(self.cols)] for r in range(self.rows)]
                 for row in reader[1:]:
                     if len(row) < 6:
@@ -368,6 +396,9 @@ class AntGridApp(LevelEditorMixin, NetworkMixin, AIMixin):
                     tile.set_units(units)
                     tile.is_obstacle = bool(obs)
                     tile.terrain_type = terr
+                    if terr == "flag" and own > 0:
+                        tile.flag_owner = own
+                        self.flag_home_coords[own] = (r, c)
 
                 self.moving_groups.clear()
                 self.combat_effects.clear()
@@ -408,6 +439,7 @@ class AntGridApp(LevelEditorMixin, NetworkMixin, AIMixin):
 
         self.hill_hold_timers = {1: 0.0, 2: 0.0, 3: 0.0, 4: 0.0}
         self.player_tickets = {1: 100, 2: 100, 3: 100, 4: 100}
+        self.flag_home_coords = {}
 
         all_coords = [(r, c) for r in range(rows) for c in range(cols)]
         random.shuffle(all_coords)
@@ -439,11 +471,17 @@ class AntGridApp(LevelEditorMixin, NetworkMixin, AIMixin):
         if "Capture the Flag" in vmode:
             for p in range(1, num_players + 1):
                 if player_owned_tiles[p]:
-                    player_owned_tiles[p][0].terrain_type = "flag"
+                    base_tile = player_owned_tiles[p][0]
+                    base_tile.terrain_type = "flag"
+                    base_tile.flag_owner = p
+                    self.flag_home_coords[p] = (base_tile.r, base_tile.c)
         elif "King of the Hill" in vmode:
-            if remaining_neutral:
-                center_tile = self.grid[rows // 2][cols // 2]
-                center_tile.terrain_type = "hill"
+            center_tile = self.grid[rows // 2][cols // 2]
+            if center_tile.is_obstacle or center_tile.owner != 0:
+                if remaining_neutral:
+                    center_tile = remaining_neutral[0]
+            center_tile.is_obstacle = False
+            center_tile.terrain_type = "hill"
         elif "VIP Commander" in vmode:
             for p in range(1, num_players + 1):
                 if player_owned_tiles[p]:
@@ -498,10 +536,13 @@ class AntGridApp(LevelEditorMixin, NetworkMixin, AIMixin):
         if self.net_role == "local":
             self.set_pause_state(target_pause_state)
         elif self.net_role == "server":
-            data = pickle.dumps({"type": "PAUSE_VOTE_REQUEST", "target_pause": target_pause_state})
-            for conn, _ in self.client_connections:
+            if not self.client_connections:
+                self.set_pause_state(target_pause_state)
+                return
+            payload = {"type": "PAUSE_VOTE_REQUEST", "target_pause": target_pause_state}
+            for conn, _ in list(self.client_connections):
                 try:
-                    conn.sendall(data)
+                    send_framed_packet(conn, payload)
                 except Exception:
                     pass
         elif self.net_role == "client":
@@ -630,8 +671,19 @@ class AntGridApp(LevelEditorMixin, NetworkMixin, AIMixin):
         self.style = ttk.Style()
         self.style.theme_use("clam")
         self.style.configure("TNotebook", background=self.board_bg_color, borderwidth=0, tabposition="n")
-        self.style.configure("TNotebook.Tab", padding=[16, 6], font=(self.font_family, 10, "bold"), anchor="center")
-        self.style.map("TNotebook.Tab", background=[("selected", self.board_bg_color), ("active", "#34495e")])
+        self.style.configure(
+            "TNotebook.Tab",
+            padding=[16, 6],
+            font=(self.font_family, 10, "bold"),
+            anchor="center",
+            background=self.neutral_tile_bg,
+            foreground=self.foreground_color
+        )
+        self.style.map(
+            "TNotebook.Tab",
+            background=[("selected", self.board_bg_color), ("active", "#34495e")],
+            foreground=[("selected", self.foreground_color), ("active", "#ffffff")]
+        )
         self.style.configure("TFrame", background=self.board_bg_color)
         self.style.configure("TLabel", background=self.board_bg_color, foreground=self.foreground_color, font=(self.font_family, 9))
         self.style.configure("Header.TLabel", font=(self.font_family, 11, "bold"), foreground=self.foreground_color)
@@ -1022,18 +1074,18 @@ class AntGridApp(LevelEditorMixin, NetworkMixin, AIMixin):
             "  ^ Factory: Generates +2 units per turn instead of +1.\n"
             "  X Obstacle: Blocks movement across the map.\n"
             "  F Flag Base: Capture and escort back home (CTF mode).\n"
-            "  * Hill Monolith: Hold to accumulate hold time (King of the Hill).\n"
+            "  * Hill Monolith: Hold for 30s to win (King of the Hill).\n"
             "  @ VIP Commander: Defend your leader (Regicide mode).\n"
             "  $ Relic Payload: Retrieve and return to factories.\n"
             "  + Beacon Node: Control nodes to drain enemy tickets (Domination).\n\n"
             "• LEVEL EDITOR: Use the Level Editor tab to paint custom tactical maps and save/load them via CSV!"
         )
-        
-        lbl = tk.Label(
+
+        self.lbl_manual = tk.Label(
             container, text=manual_text, font=(self.font_family, 10),
             bg=self.board_bg_color, fg=self.foreground_color, justify=tk.LEFT, wraplength=900
         )
-        lbl.pack(anchor="w", pady=10)
+        self.lbl_manual.pack(anchor="w", pady=10)
 
     def get_max_steps_allowed(self, units_sending):
         rule = self.movement_rule_var.get()
@@ -1087,14 +1139,19 @@ class AntGridApp(LevelEditorMixin, NetworkMixin, AIMixin):
         source_tile.set_units(source_tile.units - count)
         speed = max(0.2, self.unit_speed_var.get() / 2.5)
 
-        carrying_flag = (source_tile.terrain_type == "flag" and source_tile.owner != owner_id and source_tile.owner != 0)
+        flag_origin = getattr(source_tile, "flag_owner", 0)
+        carrying_flag = (source_tile.terrain_type == "flag" and flag_origin not in (0, owner_id))
         carrying_relic = (source_tile.terrain_type == "relic")
         if carrying_flag:
             source_tile.terrain_type = "normal"
+            source_tile.flag_owner = 0
         if carrying_relic:
             source_tile.terrain_type = "normal"
 
-        self.moving_groups.append(MovingGroup(owner_id, count, path_coords, speed, carrying_flag, carrying_relic))
+        grp = MovingGroup(owner_id, count, path_coords, speed, carrying_flag, carrying_relic)
+        if carrying_flag:
+            grp.flag_origin_owner = flag_origin
+        self.moving_groups.append(grp)
         self.play_sound("dispatch")
         self.log_match_event("UNIT_DISPATCH", {"player": owner_id, "count": count, "source": [source_tile.r, source_tile.c], "destination": [path_coords[-1][0], path_coords[-1][1]]})
 
@@ -1109,10 +1166,13 @@ class AntGridApp(LevelEditorMixin, NetworkMixin, AIMixin):
                 chosen.set_units(chosen.units + (2 if chosen.terrain_type == "factory" else 1))
 
     def player_is_alive(self, p):
-        if self.victory_mode_var.get() == "VIP Commander (@)":
+        vmode = self.victory_mode_var.get()
+        if vmode == "VIP Commander (@)":
             has_commander = any(self.grid[r][c].owner == p and self.grid[r][c].terrain_type == "commander" for r in range(self.rows) for c in range(self.cols))
             if not has_commander:
                 return False
+        if "Domination" in vmode and self.player_tickets.get(p, 0) <= 0:
+            return False
         for r in range(self.rows):
             for c in range(self.cols):
                 if self.grid[r][c].owner == p and self.grid[r][c].units > 0:
@@ -1143,18 +1203,37 @@ class AntGridApp(LevelEditorMixin, NetworkMixin, AIMixin):
             units = sum(self.grid[r][c].units for r in range(self.rows) for c in range(self.cols) if self.grid[r][c].owner == p)
             units += sum(grp.count for grp in self.moving_groups if grp.owner == p)
             units += sum(eff.grp.count for eff in self.combat_effects if eff.grp.owner == p and not eff.resolved)
-            if tiles > 0 or units > 0:
+
+            eliminated = (tiles == 0 and units == 0)
+            if "Domination" in vmode and self.player_tickets[p] <= 0:
+                eliminated = True
+            if "VIP Commander" in vmode:
+                has_cmd = any(self.grid[r][c].owner == p and self.grid[r][c].terrain_type == "commander" for r in range(self.rows) for c in range(self.cols))
+                if not has_cmd:
+                    eliminated = True
+
+            if not eliminated:
                 alive_players.append(p)
 
             stat_text = f"Player {p} | Tiles: {tiles} | Units: {units}"
             if "King of the Hill" in vmode:
-                stat_text = f"Player {p} | Tiles: {tiles} | Hill: {int(self.hill_hold_timers[p])}s"
+                stat_text = f"Player {p} | Tiles: {tiles} | Hill: {int(self.hill_hold_timers[p])}/{int(self.hill_win_seconds)}s"
             elif "Domination" in vmode:
-                stat_text = f"Player {p} | Tiles: {tiles} | Tix: {int(self.player_tickets[p])}"
+                stat_text = f"Player {p} | Tiles: {tiles} | Tix: {max(0, int(self.player_tickets[p]))}"
 
-            if tiles == 0 and units == 0:
+            if eliminated:
                 stat_text = f"Player {p} | ELIMINATED"
             lbl.config(text=stat_text, bg=self.get_player_bg_tint(p), fg=self.player_colors[p])
+
+        if self.game_running and self.net_role != "client":
+            if "King of the Hill" in vmode:
+                for p in range(1, self.num_players + 1):
+                    if self.hill_hold_timers[p] >= self.hill_win_seconds:
+                        self.trigger_victory(p, "King of the Hill Victory!", f"Player {p} held the Hill Monolith (*) for {int(self.hill_win_seconds)}s and won!")
+                        return
+            if len(alive_players) == 1:
+                winner = alive_players[0]
+                self.trigger_victory(winner, "Victory!", f"Player {winner} is the last commander standing and won the match!")
 
     def update_turn_timer_bar(self):
         if not self.turn_bar_canvas:
@@ -1196,8 +1275,8 @@ class AntGridApp(LevelEditorMixin, NetworkMixin, AIMixin):
                     beacons = [self.grid[r][c] for r in range(self.rows) for c in range(self.cols) if self.grid[r][c].terrain_type == "beacon" and self.grid[r][c].owner > 0]
                     for b in beacons:
                         for p in range(1, self.num_players + 1):
-                            if p != b.owner:
-                                self.player_tickets[p] -= dt * 0.5
+                            if p != b.owner and self.player_tickets[p] > 0:
+                                self.player_tickets[p] = max(0.0, self.player_tickets[p] - dt * 0.5)
 
                 if self.game_mode_var.get() == "Single Player (vs AI)" and self.current_turn_player != 1 and not self.combat_effects:
                     self.ai_action_timer += dt
@@ -1249,6 +1328,27 @@ class AntGridApp(LevelEditorMixin, NetworkMixin, AIMixin):
         self.render_canvas()
         self.root.after(self.last_tick_ms, self.game_loop)
 
+    def _return_or_drop_payload(self, grp, tile):
+        """Drops a carried flag/relic onto the tile or returns a flag to its home base if contested/neutral."""
+        if grp.carrying_flag:
+            flag_owner = getattr(grp, "flag_origin_owner", 0)
+            if tile.owner == flag_owner and flag_owner in self.flag_home_coords:
+                hr, hc = self.flag_home_coords[flag_owner]
+                home_tile = self.grid[hr][hc]
+                home_tile.terrain_type = "flag"
+                home_tile.flag_owner = flag_owner
+            elif tile.terrain_type == "normal":
+                tile.terrain_type = "flag"
+                tile.flag_owner = flag_owner
+            elif flag_owner in self.flag_home_coords:
+                hr, hc = self.flag_home_coords[flag_owner]
+                home_tile = self.grid[hr][hc]
+                home_tile.terrain_type = "flag"
+                home_tile.flag_owner = flag_owner
+        if grp.carrying_relic:
+            if tile.terrain_type == "normal":
+                tile.terrain_type = "relic"
+
     def resolve_arrival(self, grp):
         dest_r, dest_c = grp.path[-1]
         tile = self.grid[dest_r][dest_c]
@@ -1258,48 +1358,59 @@ class AntGridApp(LevelEditorMixin, NetworkMixin, AIMixin):
 
         self.play_sound("combat")
 
-        if grp.carrying_flag and tile.terrain_type == "flag" and tile.owner == grp.owner:
-            self.game_running = False
-            self.play_sound("victory")
-            messagebox.showinfo("CTF Victory!", f"Player {grp.owner} successfully captured the enemy flag and won!")
+        # Check CTF score when escorting an enemy flag onto own home flag base
+        if grp.carrying_flag and tile.terrain_type == "flag" and tile.owner == grp.owner and getattr(tile, "flag_owner", tile.owner) == grp.owner:
+            tile.set_units(min(MAX_TILE_CAPACITY, tile.units + grp.count))
+            self.trigger_victory(grp.owner, "CTF Victory!", f"Player {grp.owner} successfully captured the enemy flag and won!")
             return
 
+        # Check Relic Extraction when bringing relic to an owned factory
         if grp.carrying_relic and tile.terrain_type == "factory" and tile.owner == grp.owner:
-            self.game_running = False
-            self.play_sound("victory")
-            messagebox.showinfo("Relic Extracted!", f"Player {grp.owner} successfully extracted the relic and won!")
+            tile.set_units(min(MAX_TILE_CAPACITY, tile.units + grp.count))
+            self.trigger_victory(grp.owner, "Relic Extracted!", f"Player {grp.owner} successfully extracted the relic and won!")
             return
 
         if tile.owner == grp.owner:
             tile.set_units(min(MAX_TILE_CAPACITY, tile.units + grp.count))
             if grp.carrying_flag:
                 tile.terrain_type = "flag"
+                tile.flag_owner = getattr(grp, "flag_origin_owner", 0)
+            if grp.carrying_relic:
+                tile.terrain_type = "relic"
         elif tile.owner == 0:
             tile.owner = grp.owner
             tile.set_units(min(MAX_TILE_CAPACITY, grp.count))
             if grp.carrying_flag:
                 tile.terrain_type = "flag"
+                tile.flag_owner = getattr(grp, "flag_origin_owner", 0)
+            if grp.carrying_relic:
+                tile.terrain_type = "relic"
         else:
             remaining = tile.units - effective_count
             if remaining > 0:
                 tile.set_units(remaining)
+                # Attackers lost: drop flag/relic on defender's tile (or return if defender owns the flag)
+                self._return_or_drop_payload(grp, tile)
             elif remaining < 0:
+                # Attackers conquered the tile
                 tile.owner = grp.owner
                 tile.set_units(min(MAX_TILE_CAPACITY, abs(remaining)))
                 if grp.carrying_flag:
                     tile.terrain_type = "flag"
+                    tile.flag_owner = getattr(grp, "flag_origin_owner", 0)
+                if grp.carrying_relic:
+                    tile.terrain_type = "relic"
                 if tile.terrain_type == "commander":
-                    tile.owner = 0
                     tile.terrain_type = "normal"
-                    self.game_running = False
-                    self.play_sound("victory")
-                    messagebox.showinfo("Regicide Victory!", f"Player {grp.owner} assassinated the enemy Commander (@) and won!")
+                    self.trigger_victory(grp.owner, "Regicide Victory!", f"Player {grp.owner} assassinated the enemy Commander (@) and won!")
                     return
             else:
+                # Exact tie: tile becomes neutral, drop flag/relic onto the contested tile
                 tile.owner = 0
                 tile.set_units(0)
                 if tile.terrain_type == "commander":
                     tile.terrain_type = "normal"
+                self._return_or_drop_payload(grp, tile)
 
     def get_board_geometry(self):
         cw, ch = max(100, self.canvas.winfo_width()), max(100, self.canvas.winfo_height())
@@ -1366,6 +1477,10 @@ class AntGridApp(LevelEditorMixin, NetworkMixin, AIMixin):
                 }
                 if tile.terrain_type in icon_map:
                     sym, col = icon_map[tile.terrain_type]
+                    if tile.terrain_type == "flag":
+                        flag_own = getattr(tile, "flag_owner", tile.owner)
+                        if flag_own in self.player_colors:
+                            col = self.player_colors[flag_own]
                     self.canvas.create_text((x1 + x2) / 2, y1 + tpx * 0.25, text=sym, fill=col, font=(self.font_family, max(10, int(tpx * 0.28)), "bold"))
 
                 ant_color = self.player_colors.get(tile.owner, "#ffffff")

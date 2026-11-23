@@ -1,39 +1,48 @@
 import random
-from config import MAX_TILE_CAPACITY
+from config import MAX_TILE_CAPACITY, LOGICAL_TILE_SIZE
 
 MAX_VISUAL_ANTS = 18
-from config import MAX_TILE_CAPACITY
 
 
 class AntParticle:
     def __init__(self, lx=None, ly=None):
-        self.lx = lx if lx is not None else random.uniform(1.5, 8.5)
-        self.ly = ly if ly is not None else random.uniform(1.5, 8.5)
+        margin_min = LOGICAL_TILE_SIZE * 0.15
+        margin_max = LOGICAL_TILE_SIZE * 0.85
+        self.lx = lx if lx is not None else random.uniform(margin_min, margin_max)
+        self.ly = ly if ly is not None else random.uniform(margin_min, margin_max)
         self.vx = random.uniform(-0.18, 0.18)
         self.vy = random.uniform(-0.18, 0.18)
 
     def update(self):
+        bound_min = LOGICAL_TILE_SIZE * 0.1
+        bound_max = LOGICAL_TILE_SIZE * 0.9
         self.lx += self.vx
         self.ly += self.vy
-        if self.lx < 1.0 or self.lx > 9.0:
+        if self.lx < bound_min or self.lx > bound_max:
             self.vx *= -1
-            self.lx = max(1.0, min(9.0, self.lx))
-        if self.ly < 1.0 or self.ly > 9.0:
+            self.lx = max(bound_min, min(bound_max, self.lx))
+        if self.ly < bound_min or self.ly > bound_max:
             self.vy *= -1
-            self.ly = max(1.0, min(9.0, self.ly))
+            self.ly = max(bound_min, min(bound_max, self.ly))
         if random.random() < 0.15:
             self.vx = max(-0.25, min(0.25, self.vx + random.uniform(-0.06, 0.06)))
             self.vy = max(-0.25, min(0.25, self.vy + random.uniform(-0.06, 0.06)))
 
 
 class MovingGroup:
-    def __init__(self, owner, count, path_coords, speed_tiles_per_sec, carrying_flag=False, carrying_relic=False):
+    def __init__(self, owner, count, path_coords, speed_tiles_per_sec, carrying_flag=False, carrying_relic=False, flag_origin_owner=0):
         self.owner = owner
         self.count = count
         self.path = path_coords
-        self.speed = speed_tiles_per_sec * 0.5 if carrying_flag else speed_tiles_per_sec
+        if carrying_flag:
+            self.speed = speed_tiles_per_sec * 0.5
+        elif carrying_relic:
+            self.speed = speed_tiles_per_sec * 0.65
+        else:
+            self.speed = speed_tiles_per_sec
         self.carrying_flag = carrying_flag
         self.carrying_relic = carrying_relic
+        self.flag_origin_owner = flag_origin_owner
         self.segment_idx = 0
         self.segment_progress = 0.0
         self.offsets = [
@@ -90,13 +99,14 @@ class Tile:
         self.units = 0
         self.is_obstacle = False
         self.terrain_type = "normal"
+        self.flag_owner = 0
         self.ants = []
 
     def set_units(self, count):
         self.units = max(0, min(MAX_TILE_CAPACITY, int(count)))
-        if self.units == 0 and not self.is_obstacle and self.terrain_type not in ["flag", "hill", "commander", "relic", "beacon"]:
+        if self.units == 0 and not self.is_obstacle and self.terrain_type not in ["flag", "commander"]:
             self.owner = 0
-        
+
         target_visual_ants = min(self.units, MAX_VISUAL_ANTS)
         while len(self.ants) < target_visual_ants:
             self.ants.append(AntParticle())

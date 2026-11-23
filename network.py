@@ -5,10 +5,9 @@ import pickle
 import time
 import csv
 import json
-from datetime import datetime
 import tkinter as tk
 from tkinter import filedialog, messagebox
-from models import MovingGroup
+from models import MovingGroup, Tile
 
 
 def get_local_lan_ip():
@@ -56,6 +55,27 @@ def recv_framed_packet(sock):
 
 
 class NetworkMixin:
+    def close_network_sockets(self):
+        self.net_role = "local"
+        if getattr(self, "server_socket", None):
+            try:
+                self.server_socket.close()
+            except Exception:
+                pass
+            self.server_socket = None
+        if getattr(self, "client_socket", None):
+            try:
+                self.client_socket.close()
+            except Exception:
+                pass
+            self.client_socket = None
+        for conn, _ in list(getattr(self, "client_connections", [])):
+            try:
+                conn.close()
+            except Exception:
+                pass
+        self.client_connections.clear()
+
     def start_server_with_broadcast(self):
         self.start_server()
         if self.net_role == "server":
@@ -69,14 +89,12 @@ class NetworkMixin:
             udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
             local_ip = get_local_lan_ip()
-            # Bind specifically to the active Wi-Fi/LAN interface so Windows doesn't route to WSL/VPN
             if local_ip != "0.0.0.0":
                 try:
                     udp_sock.bind((local_ip, 0))
                 except Exception:
                     pass
 
-            # Calculate directed subnet broadcast (e.g., 192.168.1.255) alongside global broadcast
             broadcast_targets = ["<broadcast>", "255.255.255.255"]
             if local_ip != "0.0.0.0" and "." in local_ip:
                 subnet_bcast = local_ip.rsplit(".", 1)[0] + ".255"
@@ -92,7 +110,7 @@ class NetworkMixin:
                         udp_sock.sendto(msg, (target, 50005))
                     except Exception:
                         pass
-                time.sleep(1.0)  # Broadcast every 1s so a 3.5s client scan catches at least 3 beacons
+                time.sleep(1.0)
         except Exception:
             pass
         finally:
@@ -189,6 +207,7 @@ class NetworkMixin:
             messagebox.showerror("Error", f"Export failed: {e}")
 
     def start_server(self):
+        self.close_network_sockets()
         try:
             port = self.server_port_var.get()
             self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -210,6 +229,7 @@ class NetworkMixin:
             if self.notebook:
                 self.notebook.select(self.tab_game)
         except Exception as e:
+            self.close_network_sockets()
             messagebox.showerror("Server Error", f"Could not host: {e}")
 
     def _server_accept_loop(self):
@@ -217,8 +237,9 @@ class NetworkMixin:
             try:
                 conn, _ = self.server_socket.accept()
                 conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                player_id = len(self.client_connections) + 2
-                if player_id > self.num_players_var.get():
+                used_ids = {pid for _, pid in self.client_connections}
+                player_id = next((p for p in range(2, self.num_players_var.get() + 1) if p not in used_ids), None)
+                if player_id is None:
                     conn.close()
                     continue
                 self.client_connections.append((conn, player_id))
@@ -231,19 +252,29 @@ class NetworkMixin:
                 break
 
     def _server_client_listener(self, conn, player_id):
-        # Blocking read loop with no timeout for waiting on client actions
         conn.settimeout(None)
         while self.net_role == "server":
             try:
                 packet = recv_framed_packet(conn)
                 if packet is None:
                     break
-                # Schedule packet handling safely on the main Tkinter UI thread
                 self.root.after(0, lambda pkt=packet, pid=player_id: self.handle_network_packet(pkt, pid))
             except Exception:
                 break
 
+        def _cleanup_disconnected():
+            entry = (conn, player_id)
+            if entry in self.client_connections:
+                self.client_connections.remove(entry)
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+        self.root.after(0, _cleanup_disconnected)
+
     def start_client(self):
+        self.close_network_sockets()
         try:
             ip, port = self.server_ip_var.get(), self.server_port_var.get()
             self.client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -265,7 +296,7 @@ class NetworkMixin:
             if self.notebook:
                 self.notebook.select(self.tab_game)
         except Exception as e:
-            self.net_role = "local"
+            self.close_network_sockets()
             messagebox.showerror("Connection Error", f"Could not connect: {e}")
 
     def _client_listen_loop(self):
@@ -274,10 +305,18 @@ class NetworkMixin:
                 packet = recv_framed_packet(self.client_socket)
                 if packet is None:
                     break
-                # Marshal UI and state updates onto the main Tkinter thread to prevent Tcl/Tk deadlocks
                 self.root.after(0, lambda pkt=packet: self.apply_network_packet(pkt))
             except Exception:
                 break
+
+        def _on_disconnect():
+            if self.net_role == "client":
+                self.close_network_sockets()
+                if self.lbl_net_connection_status:
+                    self.lbl_net_connection_status.config(text="Status: Disconnected from Host", foreground="#ff5555")
+                messagebox.showwarning("Disconnected", "Lost connection to the LAN host.")
+
+        self.root.after(0, _on_disconnect)
 
     def send_packet_to_server(self, packet):
         if self.client_socket and self.net_role == "client":
@@ -292,8 +331,6 @@ class NetworkMixin:
         if self.net_role != "server" or not self.client_connections:
             return
 
-        # Built-in rate limiter: cap continuous game_loop broadcasts to ~10 Hz (every 100ms)
-        # so the TCP socket isn't flooded 30 times a second, while still allowing immediate forced updates.
         now = time.time()
         last_t = getattr(self, "_last_broadcast_time", 0.0)
         if not force and (now - last_t) < 0.10:
@@ -305,13 +342,24 @@ class NetworkMixin:
             "rows": self.rows,
             "cols": self.cols,
             "num_players": self.num_players,
-            "grid_data": [[(t.owner, t.units, t.is_obstacle, t.terrain_type) for t in row] for row in self.grid],
+            "victory_mode": self.victory_mode_var.get(),
+            "game_running": self.game_running,
+            "grid_data": [
+                [(t.owner, t.units, t.is_obstacle, t.terrain_type, getattr(t, "flag_owner", 0)) for t in row]
+                for row in self.grid
+            ],
             "current_turn": self.current_turn_player,
             "turn_time": self.turn_time_left,
             "match_time": self.match_elapsed_seconds,
             "is_paused": self.is_paused,
+            "hill_timers": self.hill_hold_timers.copy(),
+            "player_tickets": self.player_tickets.copy(),
             "moving_groups": [
-                (g.owner, g.count, g.path, g.speed, g.segment_idx, g.segment_progress, g.offsets, g.carrying_flag, g.carrying_relic)
+                (
+                    g.owner, g.count, g.path, g.speed,
+                    g.segment_idx, g.segment_progress, g.offsets,
+                    g.carrying_flag, g.carrying_relic, getattr(g, "flag_origin_owner", 0)
+                )
                 for g in self.moving_groups
             ]
         }
@@ -322,10 +370,9 @@ class NetworkMixin:
         dead_clients = []
         for conn, pid in list(self.client_connections):
             try:
-                conn.settimeout(0.2)  # Prevent main UI thread from freezing if a client's buffer fills
+                conn.settimeout(0.2)
                 conn.sendall(framed_data)
             except socket.timeout:
-                # Client is temporarily lagging; skip this frame without disconnecting
                 pass
             except Exception:
                 dead_clients.append((conn, pid))
@@ -345,35 +392,59 @@ class NetworkMixin:
 
     def handle_network_packet(self, packet, player_id):
         ptype = packet.get("type")
-        if ptype == "DISPATCH" and packet.get("player_id") == self.current_turn_player:
-            sr, sc = packet["source"]
-            source_tile = self.grid[sr][sc]
-            if source_tile.owner == player_id:
-                self.dispatch_units(source_tile, packet["count"], packet["path"])
-                self.broadcast_game_state(force=True)
+        if ptype == "DISPATCH" and player_id == self.current_turn_player and not self.is_paused:
+            sr, sc = packet.get("source", (-1, -1))
+            path = packet.get("path", [])
+            count = int(packet.get("count", 0))
+            if 0 <= sr < self.rows and 0 <= sc < self.cols and len(path) >= 2 and count > 0:
+                source_tile = self.grid[sr][sc]
+                dest = tuple(path[-1])
+                if source_tile.owner == player_id and source_tile.units >= count:
+                    valid_paths = self.compute_reachable_tiles(source_tile, count, player_id)
+                    if dest in valid_paths:
+                        self.dispatch_units(source_tile, count, valid_paths[dest])
+                        self.broadcast_game_state(force=True)
+        elif ptype == "PAUSE_VOTE_RESPONSE":
+            if packet.get("accepted", False):
+                self.set_pause_state(packet.get("target_pause", not self.is_paused))
 
     def apply_network_packet(self, packet):
         ptype = packet.get("type")
+        if ptype == "PAUSE_VOTE_REQUEST":
+            target_pause = packet.get("target_pause", True)
+            action_word = "pause" if target_pause else "resume"
+            accepted = messagebox.askyesno("LAN Pause Vote", f"Host wants to {action_word} the match. Accept?")
+            self.send_packet_to_server({"type": "PAUSE_VOTE_RESPONSE", "accepted": accepted, "target_pause": target_pause})
+            return
+
         if ptype == "STATE_UPDATE":
             grid_data = packet["grid_data"]
             r_cnt = packet.get("rows", len(grid_data))
             c_cnt = packet.get("cols", len(grid_data[0]) if grid_data else 0)
             self.num_players = packet.get("num_players", self.num_players)
+            if "victory_mode" in packet:
+                self.victory_mode_var.set(packet["victory_mode"])
+            if "game_running" in packet:
+                self.game_running = packet["game_running"]
+            if "hill_timers" in packet:
+                self.hill_hold_timers = packet["hill_timers"]
+            if "player_tickets" in packet:
+                self.player_tickets = packet["player_tickets"]
 
-            # Rebuild client grid automatically if host has a different map size
             if r_cnt != self.rows or c_cnt != self.cols:
-                from models import Tile
                 self.rows, self.cols = r_cnt, c_cnt
                 self.grid = [[Tile(r, c) for c in range(self.cols)] for r in range(self.rows)]
 
             for r in range(self.rows):
                 for c in range(self.cols):
-                    owner, units, is_obs, terr = grid_data[r][c]
+                    cell = grid_data[r][c]
+                    owner, units, is_obs, terr = cell[:4]
+                    flag_own = cell[4] if len(cell) > 4 else 0
                     tile = self.grid[r][c]
                     tile.owner = owner
                     tile.is_obstacle = is_obs
                     tile.terrain_type = terr
-                    # Only call set_units when the unit count actually changed to avoid resetting ant positions every tick
+                    tile.flag_owner = flag_own
                     if tile.units != units:
                         tile.set_units(units)
 
@@ -382,8 +453,10 @@ class NetworkMixin:
             self.match_elapsed_seconds = packet.get("match_time", self.match_elapsed_seconds)
             self.is_paused = packet["is_paused"]
             self.moving_groups.clear()
-            for owner, count, path, speed, s_idx, s_prog, offsets, flag, relic in packet["moving_groups"]:
-                g = MovingGroup(owner, count, path, speed, flag, relic)
+            for mg in packet["moving_groups"]:
+                owner, count, path, speed, s_idx, s_prog, offsets, flag, relic = mg[:9]
+                flag_origin = mg[9] if len(mg) > 9 else 0
+                g = MovingGroup(owner, count, path, speed, flag, relic, flag_origin)
                 g.segment_idx, g.segment_progress, g.offsets = s_idx, s_prog, offsets
                 self.moving_groups.append(g)
             self.update_turn_banner()

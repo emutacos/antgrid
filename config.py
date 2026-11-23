@@ -3,7 +3,8 @@ import configparser
 
 MAX_TILE_CAPACITY = 100
 LOGICAL_TILE_SIZE = 10
-SETTINGS_FILE = "settings.ini"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+SETTINGS_FILE = os.path.join(BASE_DIR, "settings.ini")
 
 AI_PERSONALITIES = [
     "Balanced",
@@ -152,21 +153,31 @@ PRESET_MAPS = {
         "P4 . . X . . X . . P3"
     ],
     "CTF & Relic Vault": [
-        "P1 F . . X . $ . X . . F P2",
-        ". . . . X . . . X . . .",
-        ". ^ . . . + + . . . ^ .",
-        "X X X . @ . . @ . X X X",
-        "X X X . @ . . @ . X X X",
-        ". ^ . . . + + . . . ^ .",
-        ". . . . X . . . X . . .",
-        "P4 F . . X . $ . X . . F P3"
+        "P1F . . . X . $ . X . . . P2F",
+        ". . . . X . . . X . . . .",
+        ". ^ . . . + + . . . . ^ .",
+        "X X X . @ . . . @ . X X X",
+        "X X X . @ . . . @ . X X X",
+        ". ^ . . . + + . . . . ^ .",
+        ". . . . X . . . X . . . .",
+        "P4F . . . X . $ . X . . . P3F"
     ]
 }
 
 
+def _normalize_hex(hex_str: str) -> str:
+    h = hex_str.strip().lstrip("#")
+    if len(h) == 3:
+        h = "".join(ch * 2 for ch in h)
+    if len(h) != 6:
+        raise ValueError("Invalid hex color")
+    return h
+
+
 def blend_hex(hex1: str, hex2: str, ratio: float = 0.32) -> str:
     try:
-        h1, h2 = hex1.lstrip("#"), hex2.lstrip("#")
+        ratio = max(0.0, min(1.0, float(ratio)))
+        h1, h2 = _normalize_hex(hex1), _normalize_hex(hex2)
         r1, g1, b1 = int(h1[0:2], 16), int(h1[2:4], 16), int(h1[4:6], 16)
         r2, g2, b2 = int(h2[0:2], 16), int(h2[2:4], 16), int(h2[4:6], 16)
         r = int(r1 * ratio + r2 * (1.0 - ratio))
