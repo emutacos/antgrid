@@ -1,4 +1,4 @@
-# antgrid
+<img width="1920" height="1080" alt="antgrid_b" src="https://github.com/user-attachments/assets/09efeedb-c96e-4eb0-bca8-ae69c6e29408" />
 **AntGrid** is a real-time-animated, turn-based tactical territory game built in Python using `tkinter` and standard library networking. Command ant colonies across a customizable 2D grid, route reinforcements along friendly territory, capture strategic terrain, and outmaneuver AI personalities or LAN opponents.
 
 ## Features
